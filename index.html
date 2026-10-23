@@ -429,10 +429,12 @@ body.sop-open{overflow:hidden;}
       <h2>Xero Settings <span class="badge">Defaults</span></h2>
       <button class="btn secondary small xero-edit-btn" id="editXeroSettingsBtn" type="button">Edit</button>
     </div>
-    <div class="xero-help">Default journal mapping. Processing Cost is calculated as daily order count × 0.63, rounded to the nearest whole AUD. Use Edit only if the current organisation requires different Xero values.</div>
+    <div class="xero-help">Default journal mapping. Processing Cost is calculated as daily order count × the per-order fee below (client default A$0.63), kept to the cent. GST % is used only for the GST / COGS ex-GST columns. Use Edit only if the current organisation requires different Xero values.</div>
     <div class="xero-settings-grid" id="xeroSettings">
       <div class="field"><label>Shipping Cost Account Code</label><input type="text" id="xeroShippingCode" value="310.1" autocomplete="off" disabled></div>
       <div class="field"><label>Cost of Goods Sold Account Code</label><input type="text" id="xeroCogsCode" value="310" autocomplete="off" disabled></div>
+      <div class="field"><label>Processing Fee per Order (A$)</label><input type="text" id="xeroProcessingRate" value="0.63" autocomplete="off" disabled></div>
+      <div class="field"><label>GST % (reporting columns only)</label><input type="text" id="xeroGstRate" value="10" autocomplete="off" disabled></div>
       <div class="field"><label>Processing Cost Account Code</label><input type="text" id="xeroProcessingCode" value="987" autocomplete="off" disabled></div>
       <div class="field"><label>Inventory Account Code</label><input type="text" id="xeroInventoryCode" value="631" autocomplete="off" disabled></div>
       <div class="field"><label>Tax Rate</label><input type="text" id="xeroTaxRate" value="BAS Excluded" autocomplete="off" disabled></div>
@@ -657,11 +659,14 @@ function money(n){ return (n<0?'-$':'$') + Math.abs(round2(n)).toLocaleString('e
    1. readWorkbook
    ========================================================================= */
 function sheetHeaderScore(row){
-  const headers = (row||[]).map(v=>String(v??'').toLowerCase().trim().replace(/\s+/g,' '));
-  const required = ['clients order number','order time','quantity','price','total cost'];
+  const headers = (row||[]).map(v=>normHeader(v));
+  const anyOf=(list)=>list.some(a=>headers.includes(a));
+  const required = ['clients order number','order time','quantity'];
   const optional = ['speedfulfill order number','sku','product name','country'];
   let score = 0;
   required.forEach(h=>{ if(headers.includes(h)) score += 10; });
+  if(anyOf(HEADER_ALIASES.price)) score += 10;
+  if(anyOf(HEADER_ALIASES.shippingCost)) score += 10;
   optional.forEach(h=>{ if(headers.includes(h)) score += 1; });
   return score;
 }
@@ -684,6 +689,83 @@ function cellHasRedFont(cell){
   return excelFontColorIsRed(color);
 }
 
+
+/* ---------------------------------------------------------------------
+   .xls (BIFF8) font-colour reader.
+   SheetJS does NOT return cell styles for legacy .xls files, so red-marked
+   Price cells were never detected for .xls uploads (red-price rule silently
+   skipped). This reads the FONT / XF / PALETTE / cell records directly from the
+   compound file and returns the set of "row,col" cells whose font is red.
+--------------------------------------------------------------------- */
+const XLS_DEFAULT_PALETTE=['000000','FFFFFF','FF0000','00FF00','0000FF','FFFF00','FF00FF','00FFFF','800000','008000','000080','808000','800080','008080','C0C0C0','808080','9999FF','993366','FFFFCC','CCFFFF','660066','FF8080','0066CC','CCCCFF','000080','FF00FF','FFFF00','00FFFF','800080','800000','008080','0000FF','00CCFF','CCFFFF','CCFFCC','FFFF99','99CCFF','FF99CC','CC99FF','FFCC99','3366FF','33CCCC','99CC00','FFCC00','FF9900','FF6600','666699','969696','003366','339966','003300','333300','993300','993366','333399','333333'];
+function isRedRgbHex(hex){
+  const r=parseInt(hex.slice(0,2),16), g=parseInt(hex.slice(2,4),16), b=parseInt(hex.slice(4,6),16);
+  return r>=150 && r>=g*1.45 && r>=b*1.45;
+}
+function readXlsRedCells(bytes, sheetIndex){
+  if(typeof XLSX==='undefined' || !XLSX.CFB) return null;
+  let cfb;
+  try{ cfb=XLSX.CFB.read(bytes,{type:'array'}); }catch(e){ return null; } // not a compound file (e.g. .xlsx)
+  const entry=XLSX.CFB.find(cfb,'/Workbook') || XLSX.CFB.find(cfb,'/Book');
+  if(!entry || !entry.content) return null;
+  // CFB content may be a plain Array or a Uint8Array depending on the build; normalise.
+  const buf=(entry.content instanceof Uint8Array)?entry.content:Uint8Array.from(entry.content);
+  const dv=new DataView(buf.buffer, buf.byteOffset, buf.length);
+  const len=buf.length;
+  const palette=XLS_DEFAULT_PALETTE.slice();
+  const fonts=[], xfFont=[], sheetPos=[];
+  let pos=0;
+  // ---- Workbook globals: FONT, XF, PALETTE, BOUNDSHEET ----
+  while(pos+4<=len){
+    const id=dv.getUint16(pos,true), size=dv.getUint16(pos+2,true), d=pos+4;
+    if(id===0x0031 && size>=8){ fonts.push(dv.getUint16(d+4,true)); }                 // FONT: icv
+    else if(id===0x00E0 && size>=2){ xfFont.push(dv.getUint16(d,true)); }             // XF: font index
+    else if(id===0x0092 && size>=2){                                                  // PALETTE
+      const n=dv.getUint16(d,true);
+      for(let i=0;i<n && d+2+i*4+3<=len;i++){
+        const hex=[0,1,2].map(k=>dv.getUint8(d+2+i*4+k).toString(16).padStart(2,'0')).join('').toUpperCase();
+        palette[i]=hex;
+      }
+    }
+    else if(id===0x0085 && size>=4){ sheetPos.push(dv.getUint32(d,true)); }           // BOUNDSHEET: stream offset
+    else if(id===0x000A && sheetPos.length){ break; }                                  // EOF of globals
+    pos=d+size;
+  }
+  // BIFF font table skips index 4 (reserved): font ids >=4 are shifted by one.
+  const fontIcv=(fi)=> fi<4 ? fonts[fi] : fonts[fi-1];
+  const redXf=xfFont.map(fi=>{
+    const icv=fontIcv(fi);
+    if(icv===undefined || icv===0x7FFF) return false;
+    if(icv>=8 && icv-8<palette.length) return isRedRgbHex(palette[icv-8]);
+    if(icv===2) return true; // fixed red in the low colour range
+    return false;
+  });
+  if(sheetIndex<0 || sheetIndex>=sheetPos.length) return null;
+  // ---- Walk the chosen worksheet substream and collect cell XF indexes ----
+  const red=new Set();
+  pos=sheetPos[sheetIndex];
+  let depth=0;
+  while(pos+4<=len){
+    const id=dv.getUint16(pos,true), size=dv.getUint16(pos+2,true), d=pos+4;
+    if(id===0x0809){ depth++; }
+    else if(id===0x000A){ depth--; if(depth<=0) break; }
+    else if(depth===1){
+      if((id===0x0203||id===0x027E||id===0x00FD||id===0x0204||id===0x0201||id===0x0006||id===0x0205) && size>=6){
+        const r=dv.getUint16(d,true), c=dv.getUint16(d+2,true), xf=dv.getUint16(d+4,true);
+        if(redXf[xf]) red.add(r+','+c);
+      } else if(id===0x00BD && size>=6){                       // MULRK
+        const r=dv.getUint16(d,true), c1=dv.getUint16(d+2,true), c2=dv.getUint16(d+size-2,true);
+        for(let c=c1,o=d+4;c<=c2 && o+6<=d+size-2;c++,o+=6){ const xf=dv.getUint16(o,true); if(redXf[xf]) red.add(r+','+c); }
+      } else if(id===0x00BE && size>=6){                       // MULBLANK
+        const r=dv.getUint16(d,true), c1=dv.getUint16(d+2,true), c2=dv.getUint16(d+size-2,true);
+        for(let c=c1,o=d+4;c<=c2 && o+2<=d+size-2;c++,o+=2){ const xf=dv.getUint16(o,true); if(redXf[xf]) red.add(r+','+c); }
+      }
+    }
+    pos=d+size;
+  }
+  return red;
+}
+
 function readWorkbook(file){
   return new Promise((resolve,reject)=>{
     const reader = new FileReader();
@@ -691,6 +773,7 @@ function readWorkbook(file){
       try{
         const data = new Uint8Array(e.target.result);
         const wb = XLSX.read(data, {type:'array', cellDates:false, cellStyles:true});
+        let xlsRedCells=null, xlsRedAttempted=false;
         if(!wb.SheetNames || wb.SheetNames.length===0){
           reject('No worksheets were found in this file.'); return;
         }
@@ -717,6 +800,8 @@ function readWorkbook(file){
 
         if(!best){ reject('No non-empty worksheets were found in this file.'); return; }
         const sheetName = best.sheetName;
+        // Legacy .xls: SheetJS gives no font colours, so read them from the BIFF records.
+        try{ xlsRedCells = readXlsRedCells(data, wb.SheetNames.indexOf(best.sheetName)); xlsRedAttempted = xlsRedCells!==null; }catch(e){ xlsRedCells=null; }
         const aoa = best.aoa;
         const ws = best.ws;
         const headerRow = best.headerRow;
@@ -732,7 +817,7 @@ function readWorkbook(file){
           const redFontCols=[];
           for(let cc=0; cc<headers.length; cc++){
             const cell=ws[XLSX.utils.encode_cell({r:rr,c:cc})];
-            if(cellHasRedFont(cell)) redFontCols.push(cc);
+            if(cellHasRedFont(cell) || (xlsRedCells && xlsRedCells.has(rr+','+cc))) redFontCols.push(cc);
           }
           Object.defineProperty(sourceRow,'__redFontCols',{value:redFontCols, enumerable:false, configurable:true});
           rows.push(sourceRow);
@@ -758,7 +843,16 @@ function readWorkbook(file){
    The full Clients Order Number is the internal unique key; the SOP display ID
    is derived separately with MID(D2,2,6).
    ========================================================================= */
-function normHeader(h){ return String(h||'').toLowerCase().trim().replace(/\s+/g,' '); }
+function normHeader(h){
+  // Lower-case, drop currency markers such as "($)" / "$", collapse whitespace.
+  // "Product Price($)" and "Shipping Cost ($)" therefore match "product price" / "shipping cost".
+  return String(h||'').toLowerCase().replace(/\(\s*[$€£¥]\s*\)/g,'').replace(/[$€£¥]/g,'').replace(/\s+/g,' ').trim();
+}
+// Header aliases used by different supplier export versions (add new spellings here).
+const HEADER_ALIASES={
+  price:['price','product price','unit price'],
+  shippingCost:['total cost','shipping cost','shipping','supplier total cost']
+};
 
 function detectHeaders(headers){
   const norm = headers.map(normHeader);
@@ -801,12 +895,12 @@ function detectHeaders(headers){
   map.quantity = findExact(['quantity']); if(map.quantity===-1) map.quantity = findContains(['qty','quantity']);
 
   // Price (line item unit price) - must NOT match "total cost" / "product price($)" / "shipping cost($)"
-  map.price = findExact(['price']);
+  map.price = findExact(HEADER_ALIASES.price);
 
   // Supplier Total cost is the authoritative shipping cost for this app.
   // It appears on the first row of each order and is counted once per order.
-  map.shippingCost = findExact(['total cost']);
-  map.totalCostCrossCheck = findExact(['total cost']);
+  map.shippingCost = findExact(HEADER_ALIASES.shippingCost);
+  map.totalCostCrossCheck = map.shippingCost;
 
   // Product Price($) is not used by this workflow. The validated reference output
   // calculates Product Cost by summing the source Price column directly.
@@ -1097,6 +1191,19 @@ function calculateOrderTotals(records){
 /* =========================================================================
    9. calculateDailyTotals
    ========================================================================= */
+function getProcessingRate(){
+  const el=(typeof document!=='undefined')?document.getElementById('xeroProcessingRate'):null;
+  const v=el?Number(String(el.value).trim()):NaN;
+  return Number.isFinite(v)&&v>=0 ? v : 0.63;
+}
+function getGstRate(){
+  const el=(typeof document!=='undefined')?document.getElementById('xeroGstRate'):null;
+  const v=el?Number(String(el.value).trim()):NaN;
+  return Number.isFinite(v)&&v>=0 ? v : 10;
+}
+function processingFeeFor(orderCount){
+  return Math.round(orderCount*getProcessingRate()*100+Number.EPSILON)/100;
+}
 function calculateDailyTotals(orders){
   const map = new Map();
   const daily = [];
@@ -1108,6 +1215,7 @@ function calculateDailyTotals(orders){
     }
     const d = map.get(key);
     d.orders += 1;
+    if(o.hasRedPrice) d.redOrders=(d.redOrders||0)+1;
     d.rows += o.lines.length;
     if(o.productInvalid) d.productInvalid = true; else d.productCost += o.productCost;
     d.shippingCost += o.shippingCost;
@@ -1115,8 +1223,8 @@ function calculateDailyTotals(orders){
     if(o.reviewNeeded){ d.reviewNeeded=true; d.status='Incomplete / Review Needed'; o.issues.forEach(i=>{ if(!d.issues.includes(i)) d.issues.push(i); }); }
   });
   daily.forEach(d=>{
-    // Processing Cost is an AUD-only manual-journal line: daily unique order count × 0.63, rounded to nearest whole AUD.
-    d.processingCostAud=Math.round((d.orders*0.63)+Number.EPSILON);
+    // Processing Cost is an AUD-only manual-journal line: daily unique order count × per-order fee (default 0.63), kept to the cent.
+    d.processingCostAud=processingFeeFor(d.orders);
     if(d.productInvalid){ d.productCost=null; d.totalSource=null; }
   });
   daily.sort((a,b)=>{
@@ -1382,7 +1490,7 @@ function buildXeroJournal(daily){
   daily.forEach(d=>{
     const status = d.reviewNeeded ? 'Incomplete / Review Needed' : 'Complete';
     const reviewReason = (d.issues||[]).join(' | ');
-    const processingAud=Number.isFinite(d.processingCostAud)?d.processingCostAud:Math.round((d.orders*0.63)+Number.EPSILON);
+    const processingAud=Number.isFinite(d.processingCostAud)?d.processingCostAud:processingFeeFor(d.orders);
     if(d.fxRate===null || d.fxRate===undefined){
       rows.push({date:d.date, dateKey:d.dateKey, account:'Shipping Cost', debit:null, credit:null, status, reviewReason});
       rows.push({date:d.date, dateKey:d.dateKey, account:'Cost of Goods Sold', debit:null, credit:null, status, reviewReason});
@@ -1463,7 +1571,9 @@ function resetProcessingStateForNewFile(){
     '#xeroCogsCode':'310',
     '#xeroProcessingCode':'987',
     '#xeroInventoryCode':'631',
-    '#xeroTaxRate':'BAS Excluded'
+    '#xeroTaxRate':'BAS Excluded',
+    '#xeroProcessingRate':'0.63',
+    '#xeroGstRate':'10'
   };
   Object.entries(xeroDefaults).forEach(([sel,val])=>{
     const el=$(sel); if(el){ el.value=val; el.disabled=true; }
@@ -1803,6 +1913,13 @@ function hasIncompleteCalculatedAmounts(records=STATE.records, orders=STATE.orde
 function reportingAudTotal(daily=STATE.daily){
   return sumRoundedMoney(daily.filter(d=>d.aud!==null && d.aud!==undefined).map(d=>d.aud));
 }
+// GST split of the AUD COGS total, same as the client's COGS sheet: GST = total/(100+g)*g, ex-GST = total/(100+g)*100.
+function gstParts(d){
+  if(d.aud===null||d.aud===undefined) return {gst:null,exGst:null,withFee:null};
+  const g=getGstRate();
+  const gst=round2(d.aud/(100+g)*g), exGst=round2(d.aud/(100+g)*100);
+  return {gst, exGst, withFee:round2(exGst+(d.processingCostAud||0))};
+}
 function renderResults(){
   setStep(5);
   show('#sec-summary'); show('#sec-daily'); show('#sec-orders');
@@ -1821,6 +1938,7 @@ function renderResults(){
 
   const cards = [
     ['Total Orders', totalOrders.toLocaleString()],
+    ['Red-price Orders (special shipping rule)', STATE.orders.filter(o=>o.hasRedPrice).length.toLocaleString()+' ('+(totalOrders?round2(STATE.orders.filter(o=>o.hasRedPrice).length/totalOrders*100):0)+'%)'],
     ['Total Rows', totalRows.toLocaleString()],
     ['Product Cost ('+STATE.fx.sourceCurrency+')', round2(productCost).toLocaleString()],
     ['Shipping Cost ('+STATE.fx.sourceCurrency+')', round2(shippingCost).toLocaleString()],
@@ -1835,7 +1953,7 @@ function renderResults(){
   ).join('');
 
   // Daily table
-  const dailyHead = ['Date','Orders','Product Cost','Shipping Cost','Processing Cost (AUD)','Total Source','FX Rate','FX Rate Date','Fallback Days','COGS (AUD)','Status','Review Reason'];
+  const dailyHead = ['Date','Orders','Product Cost','Shipping Cost','Processing Cost (AUD)','Total Source','FX Rate','FX Rate Date','Fallback Days','COGS (AUD)','GST (AUD)','COGS before fee (ex GST)','COGS + Processing fee','Red-price Orders','Status','Review Reason'];
   $('#dailyTable thead').innerHTML = '<tr>'+dailyHead.map(h=>'<th>'+h+'</th>').join('')+'</tr>';
   $('#dailyTable tbody').innerHTML = STATE.daily.map(d=>`
     <tr>
@@ -1849,6 +1967,10 @@ function renderResults(){
       <td class="right mono">${escapeHtml(d.fxRateDate || '—')}</td>
       <td class="right mono">${d.fxFallbackDays ?? '—'}</td>
       <td class="right mono"><b>${d.aud===null?'—':'A$'+round2(d.aud).toLocaleString()}</b></td>
+      <td class="right mono">${gstParts(d).gst===null?'—':'A$'+gstParts(d).gst.toLocaleString()}</td>
+      <td class="right mono">${gstParts(d).exGst===null?'—':'A$'+gstParts(d).exGst.toLocaleString()}</td>
+      <td class="right mono">${gstParts(d).withFee===null?'—':'A$'+gstParts(d).withFee.toLocaleString()}</td>
+      <td class="right mono">${d.redOrders||0}</td>
       <td>${d.reviewNeeded? '<span class="status-pill status-warn">Incomplete / Review Needed</span>' : '<span class="status-pill status-ok">Complete</span>'}</td>
       <td>${escapeHtml((d.issues||[]).join(' | '))}</td>
     </tr>`).join('');
@@ -1943,12 +2065,13 @@ function buildSummarySheetData(){
     [],
     ['Metric','Value'],
     ['Total Orders', STATE.orders.length],
+    ['Red-price Orders (special shipping rule)', STATE.orders.filter(o=>o.hasRedPrice).length],
     ['Total Rows', STATE.records.length],
     ['Product Cost ('+STATE.fx.sourceCurrency+')', round2(productCost)],
     ['Shipping Cost ('+STATE.fx.sourceCurrency+')', round2(shippingCost)],
     ['Processing Cost (AUD)', stableSum(STATE.daily.map(d=>d.processingCostAud||0))],
     ['Red-price shipping rule', 'If any Price cell in an order is red: Shipping = Total cost − sum of ALL Price values in that full order.'],
-    ['Processing rule', 'Daily number of orders × 0.63, rounded to nearest whole AUD.'],
+    ['Processing rule', 'Daily number of orders × A$'+getProcessingRate()+' per order, kept to the cent.'],
     ['Total Source Cost', round2(productCost+shippingCost)],
     ['FX Rate', STATE.fx.rate===null?'Daily / unavailable dates marked Review Needed':STATE.fx.rate],
     ['FX Direction', 'USD × AUD-per-USD rate'],
@@ -1965,10 +2088,11 @@ function buildSummarySheetData(){
   ];
 }
 function buildDailySheetData(){
-  const head = ['Date','Orders','Product Cost','Shipping Cost','Processing Cost AUD','Total Source','FX Rate','FX Rate Date','Fallback Days','COGS AUD','Status','Review Reason'];
+  const head = ['Date','Orders','Product Cost','Shipping Cost','Processing Cost AUD','Total Source','FX Rate','FX Rate Date','Fallback Days','COGS AUD','GST AUD','COGS before fee (ex GST)','COGS + Processing fee','Red-price Orders','Status','Review Reason'];
   const body = STATE.daily.map(d=>[
     d.date,d.orders,round2(d.productCost),round2(d.shippingCost),round2(d.processingCostAud||0),round2(d.totalSource),
     d.fxRate??'',d.fxRateDate||'',d.fxFallbackDays??'',d.aud===null?'':round2(d.aud),
+    gstParts(d).gst??'',gstParts(d).exGst??'',gstParts(d).withFee??'',d.redOrders||0,
     d.reviewNeeded?'Incomplete / Review Needed':'Complete',(d.issues||[]).join(' | ')
   ]);
   return [head, ...body];
@@ -2134,7 +2258,7 @@ function desiredSheet1Data(){
 }
 function desiredPivotRows(){
   return STATE.daily.map(d=>({
-    date:d.date, rows:d.rows,
+    date:d.date, rows:d.orders,
     product:d.productInvalid?naCell():d.productCost,
     shipping:d.shippingCost,
     rate:d.fxRate,
@@ -2145,7 +2269,7 @@ function desiredPivotRows(){
 }
 function desiredSheet3Data(){
   const p=desiredPivotRows();
-  const out=[[],[],['Row Labels','Count of Order','Sum of Price']];
+  const out=[[],[],['Row Labels','Count of Orders','Sum of Price']];
   p.forEach(x=>out.push([x.date,x.rows,x.product]));
   const invalid=p.some(x=>x.product && typeof x.product==='object' && x.product.t==='e');
   out.push(['Grand Total',stableSum(p.map(x=>x.rows)),invalid?naCell():stableSum(p.map(x=>x.product))]);
@@ -2157,7 +2281,7 @@ function desiredSheet2Data(){
   STATE.records.forEach(r=>out.push([r.orderId||'',r.reportingDate||'',r.priceInvalid?naCell():(r.priceRaw??''),r.isGroupStart?(r.shippingRawDisplay??''):'']));
   while(out.length<22) out.push([]);
   // First pivot block G:L, matching the desired workbook layout.
-  out[1][6]='Row Labels'; out[1][7]='Count of Order'; out[1][8]='Sum of Price'; out[1][9]='Sum of Total cost'; out[1][11]='Rate(USD to AUD';
+  out[1][6]='Row Labels'; out[1][7]='Count of Orders'; out[1][8]='Sum of Price'; out[1][9]='Sum of Total cost'; out[1][11]='Rate(USD to AUD';
   p.forEach((x,i)=>{ const r=2+i; out[r][6]=x.date; out[r][7]=x.rows; out[r][8]=x.product; out[r][9]=x.shipping; out[r][11]=x.rate; });
   const invalid=p.some(x=>x.product && typeof x.product==='object' && x.product.t==='e');
   const gt=2+p.length; out[gt][6]='Grand Total'; out[gt][7]=stableSum(p.map(x=>x.rows)); out[gt][8]=invalid?naCell():stableSum(p.map(x=>x.product)); out[gt][9]=stableSum(p.map(x=>x.shipping));
@@ -2315,7 +2439,7 @@ $('#exportAuditBtn').addEventListener('click', ()=>{
   ], 'COGS_Audit_'+STATE.file.name.replace(/\.(xls|xlsx)$/i,'')+'.xlsx');
 });
 
-['#xeroShippingCode','#xeroCogsCode','#xeroProcessingCode','#xeroInventoryCode','#xeroTaxRate'].forEach(sel=>{
+['#xeroShippingCode','#xeroCogsCode','#xeroProcessingCode','#xeroInventoryCode','#xeroTaxRate','#xeroProcessingRate','#xeroGstRate'].forEach(sel=>{
   const el=$(sel);
   if(el) el.addEventListener('input',()=>{ if(STATE.xero && STATE.xero.length) renderXeroPreview(); });
 });
@@ -2323,7 +2447,7 @@ $('#exportAuditBtn').addEventListener('click', ()=>{
 setStep(1);
 
 function toggleXeroSettingsEdit(){
-  const fields=['#xeroShippingCode','#xeroCogsCode','#xeroProcessingCode','#xeroInventoryCode','#xeroTaxRate']
+  const fields=['#xeroShippingCode','#xeroCogsCode','#xeroProcessingCode','#xeroInventoryCode','#xeroTaxRate','#xeroProcessingRate','#xeroGstRate']
     .map(sel=>$(sel)).filter(Boolean);
   if(!fields.length) return;
   const editing=fields[0].disabled;
@@ -2335,9 +2459,18 @@ function toggleXeroSettingsEdit(){
   if(editing) fields[0].focus();
   renderXeroPreview();
 }
+function refreshProcessingAndGst(){
+  if(!STATE.daily||!STATE.daily.length) return;
+  STATE.daily.forEach(d=>{ d.processingCostAud=processingFeeFor(d.orders); });
+  STATE.xero=buildXeroJournal(STATE.daily);
+  renderResults();
+}
+['#xeroProcessingRate','#xeroGstRate'].forEach(sel=>{
+  const el=$(sel); if(el) el.addEventListener('change',refreshProcessingAndGst);
+});
 const editXeroSettingsBtn=$('#editXeroSettingsBtn');
 if(editXeroSettingsBtn) editXeroSettingsBtn.addEventListener('click',toggleXeroSettingsEdit);
-['#xeroShippingCode','#xeroCogsCode','#xeroProcessingCode','#xeroInventoryCode','#xeroTaxRate'].forEach(sel=>{
+['#xeroShippingCode','#xeroCogsCode','#xeroProcessingCode','#xeroInventoryCode','#xeroTaxRate','#xeroProcessingRate','#xeroGstRate'].forEach(sel=>{
   const el=$(sel);
   if(el) el.addEventListener('input',()=>{ if(STATE.xero?.length) renderXeroPreview(); });
 });
