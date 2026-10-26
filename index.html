@@ -225,6 +225,8 @@ select,input[type=text],input[type=number],input[type=date]{
 body.sop-open{overflow:hidden;}
 @media(max-width:640px){.sopviewer{padding:6px}.sopviewer-pages{padding:8px}.sopviewer-head{padding:8px 10px}}
 
+.neg-row td{background:#FBEAE8 !important;color:#A3271E;}
+.status-neg{background:var(--red-soft);color:var(--red);}
 </style>
 </head>
 <body>
@@ -1169,9 +1171,9 @@ function calculateOrderTotals(records){
         if(!o.issues.includes(msg)) o.issues.push(msg);
       }else{
         o.shippingCost=o.shippingSourceCost-o.productCost;
-        if(o.shippingCost<0){
+        if(o.shippingCost<0){ o.negativeShipping=true;
           o.reviewNeeded=true; o.status='Incomplete / Review Needed';
-          const msg='Red-price order produced a negative Shipping Cost after Total cost − all Product Prices; review the source order.';
+          const msg='NEGATIVE SHIPPING — supplier Total cost '+round2(o.shippingSourceCost)+' is lower than the sum of all Product Prices '+round2(o.productCost)+', so Shipping Cost = '+round2(o.shippingCost)+'. Value kept as calculated; confirm with supplier.';
           if(!o.issues.includes(msg)) o.issues.push(msg);
         }
       }
@@ -1182,6 +1184,7 @@ function calculateOrderTotals(records){
     // detail-level reconciliation uses the same applied value as order/daily totals.
     const start=o.lines.find(r=>r.isGroupStart && !r.duplicateOrderStart);
     if(start) start.appliedShippingCost=o.shippingCost;
+    if(o.negativeShipping) o.lines.forEach(r=>{ r.negativeShipping=true; });
     o.totalSource = o.productInvalid ? null : (o.productCost + o.shippingCost);
 
   });
@@ -1216,6 +1219,7 @@ function calculateDailyTotals(orders){
     const d = map.get(key);
     d.orders += 1;
     if(o.hasRedPrice) d.redOrders=(d.redOrders||0)+1;
+    if(o.negativeShipping) d.negativeShippingOrders=(d.negativeShippingOrders||0)+1;
     d.rows += o.lines.length;
     if(o.productInvalid) d.productInvalid = true; else d.productCost += o.productCost;
     d.shippingCost += o.shippingCost;
@@ -1413,6 +1417,15 @@ function validateData(records, orders){
         });
       }
     }
+  });
+  orders.filter(o=>o.negativeShipping).forEach(o=>{
+    const first=o.lines[0].rowNum, last=o.lines[o.lines.length-1].rowNum;
+    review.push({
+      row:'Order (NEGATIVE SHIPPING) rows '+first+'–'+last, internalOrderKey:o.internalOrderKey||'—', orderId:o.orderId||'—', date:o.date||'—',
+      issue:'NEGATIVE SHIPPING — supplier Total cost is lower than the sum of all Product Prices (red-price rule gives a negative Shipping Cost).',
+      original:'Total cost '+round2(o.shippingSourceCost)+' | Product Prices '+round2(o.productCost)+' | Shipping '+round2(o.shippingCost),
+      suggested:'Confirm with supplier whether Total cost includes the product prices for this order. Calculated value is kept unchanged.'
+    });
   });
   return review;
 }
@@ -1938,6 +1951,7 @@ function renderResults(){
 
   const cards = [
     ['Total Orders', totalOrders.toLocaleString()],
+    ['NEGATIVE SHIPPING ORDERS — REVIEW', STATE.orders.filter(o=>o.negativeShipping).length.toLocaleString(), STATE.orders.some(o=>o.negativeShipping)],
     ['Red-price Orders (special shipping rule)', STATE.orders.filter(o=>o.hasRedPrice).length.toLocaleString()+' ('+(totalOrders?round2(STATE.orders.filter(o=>o.hasRedPrice).length/totalOrders*100):0)+'%)'],
     ['Total Rows', totalRows.toLocaleString()],
     ['Product Cost ('+STATE.fx.sourceCurrency+')', round2(productCost).toLocaleString()],
@@ -1953,10 +1967,10 @@ function renderResults(){
   ).join('');
 
   // Daily table
-  const dailyHead = ['Date','Orders','Product Cost','Shipping Cost','Processing Cost (AUD)','Total Source','FX Rate','FX Rate Date','Fallback Days','COGS (AUD)','GST (AUD)','COGS before fee (ex GST)','COGS + Processing fee','Red-price Orders','Status','Review Reason'];
+  const dailyHead = ['Date','Orders','Product Cost','Shipping Cost','Processing Cost (AUD)','Total Source','FX Rate','FX Rate Date','Fallback Days','COGS (AUD)','GST (AUD)','COGS before fee (ex GST)','COGS + Processing fee','Red-price Orders','Negative Shipping Orders','Status','Review Reason'];
   $('#dailyTable thead').innerHTML = '<tr>'+dailyHead.map(h=>'<th>'+h+'</th>').join('')+'</tr>';
   $('#dailyTable tbody').innerHTML = STATE.daily.map(d=>`
-    <tr>
+    <tr class="${d.negativeShippingOrders?'neg-row':''}">
       <td class="mono">${escapeHtml(d.date)}</td>
       <td class="right mono">${d.orders}</td>
       <td class="right mono">${round2(d.productCost).toLocaleString()}</td>
@@ -1971,6 +1985,7 @@ function renderResults(){
       <td class="right mono">${gstParts(d).exGst===null?'—':'A$'+gstParts(d).exGst.toLocaleString()}</td>
       <td class="right mono">${gstParts(d).withFee===null?'—':'A$'+gstParts(d).withFee.toLocaleString()}</td>
       <td class="right mono">${d.redOrders||0}</td>
+      <td class="right mono">${d.negativeShippingOrders||0}</td>
       <td>${d.reviewNeeded? '<span class="status-pill status-warn">Incomplete / Review Needed</span>' : '<span class="status-pill status-ok">Complete</span>'}</td>
       <td>${escapeHtml((d.issues||[]).join(' | '))}</td>
     </tr>`).join('');
@@ -1979,7 +1994,7 @@ function renderResults(){
   const ordHead = ['SOP Order ID','Internal Order Key','Date','Lines','Product Cost','Shipping Cost','Shipping Rule','Total Source','AUD','Status'];
   $('#ordersTable thead').innerHTML = '<tr>'+ordHead.map(h=>'<th>'+h+'</th>').join('')+'</tr>';
   $('#ordersTable tbody').innerHTML = STATE.orders.map(o=>`
-    <tr>
+    <tr class="${o.negativeShipping?'neg-row':''}">
       <td class="mono">${escapeHtml(o.orderId||'—')}</td>
       <td class="mono">${escapeHtml(o.internalOrderKey||'—')}</td>
       <td class="mono">${escapeHtml(o.date||'—')}</td>
@@ -1989,7 +2004,7 @@ function renderResults(){
       <td>${escapeHtml(o.shippingRule||'Normal')}</td>
       <td class="right mono">${round2(o.totalSource).toLocaleString()}</td>
       <td class="right mono">${o.aud===null?'—':'A$'+round2(o.aud).toLocaleString()}</td>
-      <td>${o.reviewNeeded? '<span class="status-pill status-warn">Incomplete / Review Needed</span>' : '<span class="status-pill status-ok">Complete</span>'}</td>
+      <td>${o.negativeShipping?'<span class="status-pill status-neg">Negative Shipping — Review</span>':(o.reviewNeeded? '<span class="status-pill status-warn">Incomplete / Review Needed</span>' : '<span class="status-pill status-ok">Complete</span>')}</td>
     </tr>`).join('');
 
   // Review table
@@ -2065,6 +2080,7 @@ function buildSummarySheetData(){
     [],
     ['Metric','Value'],
     ['Total Orders', STATE.orders.length],
+    ['Negative Shipping Orders (Review)', STATE.orders.filter(o=>o.negativeShipping).length],
     ['Red-price Orders (special shipping rule)', STATE.orders.filter(o=>o.hasRedPrice).length],
     ['Total Rows', STATE.records.length],
     ['Product Cost ('+STATE.fx.sourceCurrency+')', round2(productCost)],
@@ -2088,29 +2104,30 @@ function buildSummarySheetData(){
   ];
 }
 function buildDailySheetData(){
-  const head = ['Date','Orders','Product Cost','Shipping Cost','Processing Cost AUD','Total Source','FX Rate','FX Rate Date','Fallback Days','COGS AUD','GST AUD','COGS before fee (ex GST)','COGS + Processing fee','Red-price Orders','Status','Review Reason'];
+  const head = ['Date','Orders','Product Cost','Shipping Cost','Processing Cost AUD','Total Source','FX Rate','FX Rate Date','Fallback Days','COGS AUD','GST AUD','COGS before fee (ex GST)','COGS + Processing fee','Red-price Orders','Negative Shipping Orders','Status','Review Reason'];
   const body = STATE.daily.map(d=>[
     d.date,d.orders,round2(d.productCost),round2(d.shippingCost),round2(d.processingCostAud||0),round2(d.totalSource),
     d.fxRate??'',d.fxRateDate||'',d.fxFallbackDays??'',d.aud===null?'':round2(d.aud),
-    gstParts(d).gst??'',gstParts(d).exGst??'',gstParts(d).withFee??'',d.redOrders||0,
+    gstParts(d).gst??'',gstParts(d).exGst??'',gstParts(d).withFee??'',d.redOrders||0,d.negativeShippingOrders||0,
     d.reviewNeeded?'Incomplete / Review Needed':'Complete',(d.issues||[]).join(' | ')
   ]);
   return [head, ...body];
 }
 function buildOrdersSheetData(){
-  const head = ['Internal Order Key (Clients Order Number)','Order ID (MID D2,2,6)','Date','Line Count','Product Cost','Supplier Total cost','Red Price Detected','Shipping Rule','Shipping Cost','Total Source','FX Rate','AUD','Status','Review Reason'];
-  const body = STATE.orders.map(o=>[o.internalOrderKey,o.orderId,o.date,o.lines.length,round2(o.productCost),round2(o.shippingSourceCost),o.hasRedPrice?'Yes':'No',o.shippingRule,round2(o.shippingCost),round2(o.totalSource),o.fxRate??'',o.aud===null?'':round2(o.aud),o.status,o.reviewNeeded?o.issues.join(' | '):'']);
+  const head = ['Internal Order Key (Clients Order Number)','Order ID (MID D2,2,6)','Date','Line Count','Product Cost','Supplier Total cost','Red Price Detected','Shipping Rule','Shipping Cost','Total Source','FX Rate','AUD','Status','Review Reason','Negative Shipping Flag'];
+  const body = STATE.orders.map(o=>[o.internalOrderKey,o.orderId,o.date,o.lines.length,round2(o.productCost),round2(o.shippingSourceCost),o.hasRedPrice?'Yes':'No',o.shippingRule,round2(o.shippingCost),round2(o.totalSource),o.fxRate??'',o.aud===null?'':round2(o.aud),o.status,o.reviewNeeded?o.issues.join(' | '):'',o.negativeShipping?'YES — REVIEW':'']);
   return [head, ...body];
 }
 function buildDetailSheetData(){
-  const head = ['Row','Clients Order Number (raw)','Internal Order Key','SOP Order ID (resolved)','Order ID Method','Date (raw)','Reporting Date','Date Method','SKU','Product Name','Quantity (raw)','Price (raw)','Price Font Red','Safe Quantity','Safe Price','Price Used for Product Cost','Applied Product Cost','Duplicate Block','Shipping Cost Applied [unique order start only]','Total cost source value','Product Price($) source (unused)','Status','Review Reason'];
+  const head = ['Row','Clients Order Number (raw)','Internal Order Key','SOP Order ID (resolved)','Order ID Method','Date (raw)','Reporting Date','Date Method','SKU','Product Name','Quantity (raw)','Price (raw)','Price Font Red','Safe Quantity','Safe Price','Price Used for Product Cost','Applied Product Cost','Duplicate Block','Shipping Cost Applied [unique order start only]','Total cost source value','Product Price($) source (unused)','Status','Review Reason','Negative Shipping Flag'];
   const body = STATE.records.map(r=>[
     r.rowNum, r.orderIdRaw||'', r.internalOrderKey||'', r.orderId||'', r.orderIdMethod, r.dateRawDisplay||'', r.reportingDate||'', r.dateMethod,
     r.sku||'', r.productName||'', r.qtyRaw??'', r.priceRaw??'', r.priceFontRed?'Yes':'No', r.qty===null?'':r.qty, r.price===null?'':r.price,
     r.calculatedLineCost===null?'':round2(r.calculatedLineCost), r.lineCost===null?'':round2(r.lineCost), r.duplicateOrderBlock?'Yes':'No', r.isGroupStart && r.appliedShippingCost!==null && r.appliedShippingCost!==undefined? round2(r.appliedShippingCost):'',
     r.isGroupStart && r.shippingCrossCheckRaw!==null && r.shippingCrossCheckRaw!==undefined ? r.shippingCrossCheckRaw : '',
     r.refProductPriceRaw??'',
-    r.reviewNeeded?'Incomplete / Review Needed':'Complete', r.issues.join(' | ')
+    r.negativeShipping?'Review Needed — Negative Shipping':(r.reviewNeeded?'Incomplete / Review Needed':'Complete'), (r.negativeShipping?'NEGATIVE SHIPPING order (see Review Needed sheet). ':'')+r.issues.join(' | '),
+    r.negativeShipping?'YES — REVIEW':''
   ]);
   return [head, ...body];
 }
@@ -2343,6 +2360,23 @@ function downloadDesiredWorkbook(filename){
       applySmartColumnWidths(ws,data,{min:11,max:22,padding:2});
     }
 
+    // NEGATIVE SHIPPING orders: red highlight on their source lines + a review note (Sheet1 column M).
+    {
+      const redStyle={ fill:{patternType:'solid', fgColor:{rgb:'FFC7CE'}}, font:{bold:true,color:{rgb:'9C0006'}} };
+      const negRows=[]; STATE.records.forEach((rec,i)=>{ if(rec.negativeShipping) negRows.push(i+2); });
+      if(name==='Sheet1' && negRows.length){
+        ws['M1']={t:'s',v:'Review',s:{font:{bold:true}}};
+        negRows.forEach(er=>{
+          for(let c=0;c<12;c++){ const t=ws[XLSX.utils.encode_cell({r:er-1,c})]; if(t) t.s=redStyle; }
+          ws['M'+er]={t:'s',v:'NEGATIVE SHIPPING — REVIEW (confirm with supplier)',s:redStyle};
+        });
+        const rg=XLSX.utils.decode_range(ws['!ref']); rg.e.c=Math.max(rg.e.c,12); ws['!ref']=XLSX.utils.encode_range(rg);
+        ws['!cols'].push({wch:48});
+      }
+      if(name==='Sheet2' && negRows.length){
+        negRows.forEach(er=>{ for(let c=0;c<4;c++){ const t=ws[XLSX.utils.encode_cell({r:er-1,c})]; if(t) t.s=redStyle; } });
+      }
+    }
     // Sheet2 AUD summary must display like the approved reference workbook.
     // Keep full-precision numeric/formula values for calculation, but format the
     // visible USD/AUD sums to 2 decimals (with thousands separators) and Total
@@ -2401,6 +2435,24 @@ function downloadWorkbook(sheets, filename){
             const target = ws[XLSX.utils.encode_cell({r,c})];
             if(target){ target.s = { fill:{patternType:'solid', fgColor:{rgb:'FFF2CC'}}, font:{color:{rgb:'9C6500'}} }; }
           }
+        }
+      }
+    }
+    // NEGATIVE SHIPPING: strong red highlight on whole row (flag column, daily count, or review item).
+    {
+      const hdr=data[headerRow]||[];
+      const flagCol=hdr.findIndex(h=>String(h)==='Negative Shipping Flag');
+      const dayCol=hdr.findIndex(h=>String(h)==='Negative Shipping Orders');
+      const isReviewSheet=String(name).toLowerCase().includes('review');
+      for(let r=headerRow+1;r<=range.e.r;r++){
+        const rowArr=data[r]||[];
+        const hit=(flagCol>=0 && /^YES/.test(String(rowArr[flagCol]||''))) ||
+                  (dayCol>=0 && Number(rowArr[dayCol])>0) ||
+                  (isReviewSheet && /NEGATIVE SHIPPING/.test(String(rowArr[0]||'')));
+        if(!hit) continue;
+        for(let c=range.s.c;c<=range.e.c;c++){
+          const target=ws[XLSX.utils.encode_cell({r,c})];
+          if(target){ target.s={ fill:{patternType:'solid', fgColor:{rgb:'FFC7CE'}}, font:{bold:true,color:{rgb:'9C0006'}} }; }
         }
       }
     }
