@@ -431,6 +431,7 @@ body.sop-open{overflow:hidden;}
       <div class="field"><label>Shipping Cost Account Code</label><input type="text" id="xeroShippingCode" value="310.1" autocomplete="off" disabled></div>
       <div class="field"><label>Cost of Goods Sold Account Code</label><input type="text" id="xeroCogsCode" value="310" autocomplete="off" disabled></div>
       <div class="field"><label>Processing Fee per Order (A$)</label><input type="text" id="xeroProcessingRate" value="0.63" autocomplete="off" disabled></div>
+      <div class="field"><label>Black price in red orders — product cost share %</label><input type="text" id="xeroBlackCostPct" value="70" autocomplete="off" disabled></div>
       <div class="field"><label>GST % (reporting columns only)</label><input type="text" id="xeroGstRate" value="10" autocomplete="off" disabled></div>
       <div class="field"><label>Processing Cost Account Code</label><input type="text" id="xeroProcessingCode" value="987" autocomplete="off" disabled></div>
       <div class="field"><label>Inventory Account Code</label><input type="text" id="xeroInventoryCode" value="631" autocomplete="off" disabled></div>
@@ -1125,6 +1126,11 @@ function buildRecords(rawRows, headers, colMap){
    6. calculateOrderTotals — group records ONLY by full Clients Order Number
    (internal unique key). The 6-digit Order ID is display/reference only.
    ========================================================================= */
+function getBlackCostShare(){
+  const el=(typeof document!=='undefined')?document.getElementById('xeroBlackCostPct'):null;
+  const v=el?Number(String(el.value).trim()):NaN;
+  return (Number.isFinite(v)&&v>=0&&v<=100 ? v : 70)/100;
+}
 function calculateOrderTotals(records){
   const map = new Map();
   const order = [];
@@ -1164,17 +1170,24 @@ function calculateOrderTotals(records){
     // Product + Shipping for that order. Sum every product Price in the order and
     // subtract that full product total from Total cost to derive Shipping Cost.
     if(o.hasRedPrice){
-      o.shippingRule='Red-price order: Total cost − all Product Prices';
+      o.shippingRule='Red order: Total cost − red prices; black prices '+Math.round(getBlackCostShare()*100)+'% cost / '+Math.round((1-getBlackCostShare())*100)+'% shipping';
       if(o.productInvalid){
         o.shippingCost=0;
         o.reviewNeeded=true; o.status='Incomplete / Review Needed';
         const msg='Red-price order cannot derive Shipping Cost because one or more Product Price values are blank/invalid.';
         if(!o.issues.includes(msg)) o.issues.push(msg);
       }else{
-        o.shippingCost=o.shippingSourceCost-o.productCost;
+        // New supplier rule: subtract ONLY the red prices from Total cost. Black prices in the same order
+        // carry cost + shipping combined: cost share (default 70%) stays product cost, the rest is shipping.
+        const share=getBlackCostShare();
+        let redSum=0, blackSum=0;
+        o.lines.forEach(r=>{ if(r.lineCost!==null){ if(r.priceFontRed) redSum+=r.lineCost; else blackSum+=r.lineCost; } });
+        o.redSum=redSum; o.blackSum=blackSum; o.blackToShipping=blackSum*(1-share);
+        o.productCost=redSum+blackSum*share;
+        o.shippingCost=o.shippingSourceCost-redSum+o.blackToShipping;
         if(o.shippingCost<0){ o.negativeShipping=true;
           o.reviewNeeded=true; o.status='Incomplete / Review Needed';
-          const msg='NEGATIVE SHIPPING — supplier Total cost '+round2(o.shippingSourceCost)+' is lower than the sum of all Product Prices '+round2(o.productCost)+', so Shipping Cost = '+round2(o.shippingCost)+'. Value kept as calculated; confirm with supplier.';
+          const msg='NEGATIVE SHIPPING — supplier Total cost '+round2(o.shippingSourceCost)+' is lower than the sum of the red Product Prices '+round2(o.redSum)+', so Shipping Cost = '+round2(o.shippingCost)+'. Value kept as calculated; confirm with supplier.';
           if(!o.issues.includes(msg)) o.issues.push(msg);
         }
       }
@@ -1184,7 +1197,7 @@ function calculateOrderTotals(records){
     // Put the derived shipping amount back onto the unique order-start record so
     // detail-level reconciliation uses the same applied value as order/daily totals.
     const start=o.lines.find(r=>r.isGroupStart && !r.duplicateOrderStart);
-    if(start) start.appliedShippingCost=o.shippingCost;
+    if(start){ start.appliedShippingCost=o.shippingCost; start.costAdjust=-(o.blackToShipping||0); }
     if(o.negativeShipping) o.lines.forEach(r=>{ r.negativeShipping=true; });
     o.totalSource = o.productInvalid ? null : (o.productCost + o.shippingCost);
 
@@ -1423,8 +1436,8 @@ function validateData(records, orders){
     const first=o.lines[0].rowNum, last=o.lines[o.lines.length-1].rowNum;
     review.push({
       row:'Order (NEGATIVE SHIPPING) rows '+first+'–'+last, internalOrderKey:o.internalOrderKey||'—', orderId:o.orderId||'—', date:o.date||'—',
-      issue:'NEGATIVE SHIPPING — supplier Total cost is lower than the sum of all Product Prices (red-price rule gives a negative Shipping Cost).',
-      original:'Total cost '+round2(o.shippingSourceCost)+' | Product Prices '+round2(o.productCost)+' | Shipping '+round2(o.shippingCost),
+      issue:'NEGATIVE SHIPPING — supplier Total cost is lower than the sum of the red Product Prices (red-price rule gives a negative Shipping Cost).',
+      original:'Total cost '+round2(o.shippingSourceCost)+' | Red Product Prices '+round2(o.redSum||0)+' | Black Prices '+round2(o.blackSum||0)+' | Shipping '+round2(o.shippingCost),
       suggested:'Confirm with supplier whether Total cost includes the product prices for this order. Calculated value is kept unchanged.'
     });
   });
@@ -1441,7 +1454,7 @@ function validateData(records, orders){
    ========================================================================= */
 function reconcileTotals(records, orders, daily, reviewItemsList=[]){
   const invalidInputRows = records.filter(r=>r.reviewNeeded && r.issues.some(i=>/not numeric|could not be parsed|Clients Order Number.*missing|No Clients Order Number|unresolved order|No date found|Order header row has no date|too short|blank/i.test(i))).length;
-  const detailTotal = stableSum(records.map(r=>(r.lineCost!==null?r.lineCost:0) + (r.isGroupStart && r.appliedShippingCost!==null && r.appliedShippingCost!==undefined ? r.appliedShippingCost:0)));
+  const detailTotal = stableSum(records.map(r=>(r.lineCost!==null?r.lineCost:0) + (r.costAdjust||0) + (r.isGroupStart && r.appliedShippingCost!==null && r.appliedShippingCost!==undefined ? r.appliedShippingCost:0)));
   const orderTotal = stableSum(orders.map(o=>o.totalSource));
   const dailyTotal = stableSum(daily.map(d=>d.totalSource));
   const detailAud = stableSum(orders.map(o=>o.aud!==null?o.aud:0));
@@ -1452,7 +1465,7 @@ function reconcileTotals(records, orders, daily, reviewItemsList=[]){
     accountingDiff(detailAud,dailyAud)
   );
 
-  const computedProductCost = stableSum(orders.map(o=>o.productCost));
+  const computedProductCost = stableSum(orders.map(o=>o.productCost+(o.blackToShipping||0)));
   const computedShippingCost = stableSum(orders.map(o=>o.shippingCost));
 
   // Product Cost is sourced directly from Price, matching the validated reference output.
@@ -1473,7 +1486,7 @@ function reconcileTotals(records, orders, daily, reviewItemsList=[]){
     }
   });
   const shippingSourceComplete = orders.length>0 && shippingSourceValidCount===orders.length && orders.every(o=>!o.productInvalid);
-  const reconstructedTotalCost = shippingSourceComplete ? stableSum(orders.map(o=>o.hasRedPrice ? (o.productCost+o.shippingCost) : o.shippingCost)) : null;
+  const reconstructedTotalCost = shippingSourceComplete ? stableSum(orders.map(o=>o.hasRedPrice ? (o.productCost+o.shippingCost-(o.blackSum||0)) : o.shippingCost)) : null;
   const shippingVsSource = shippingSourceComplete ? accountingDiff(reconstructedTotalCost,sumTotalCostCrossCheck) : null;
 
   const sourceChecksAvailable = productSourceComplete || shippingSourceComplete;
@@ -1587,7 +1600,8 @@ function resetProcessingStateForNewFile(){
     '#xeroInventoryCode':'631',
     '#xeroTaxRate':'BAS Excluded',
     '#xeroProcessingRate':'0.63',
-    '#xeroGstRate':'10'
+    '#xeroGstRate':'10',
+    '#xeroBlackCostPct':'70'
   };
   Object.entries(xeroDefaults).forEach(([sel,val])=>{
     const el=$(sel); if(el){ el.value=val; el.disabled=true; }
@@ -2087,7 +2101,7 @@ function buildSummarySheetData(){
     ['Product Cost ('+STATE.fx.sourceCurrency+')', round2(productCost)],
     ['Shipping Cost ('+STATE.fx.sourceCurrency+')', round2(shippingCost)],
     ['Processing Cost (AUD)', stableSum(STATE.daily.map(d=>d.processingCostAud||0))],
-    ['Red-price shipping rule', 'If any Price cell in an order is red: Shipping = Total cost − sum of ALL Price values in that full order.'],
+    ['Red-price shipping rule', 'If any Price cell in an order is red: Shipping = Total cost − sum of RED prices + the shipping share of the BLACK prices in that order; Product Cost = red prices + the cost share of the black prices (default 70/30). Orders without red keep Shipping = Total cost.'],
     ['Processing rule', 'Daily number of orders × A$'+getProcessingRate()+' per order, kept to the cent.'],
     ['Total Source Cost', round2(productCost+shippingCost)],
     ['FX Rate', STATE.fx.rate===null?'Daily / unavailable dates marked Review Needed':STATE.fx.rate],
@@ -2115,8 +2129,8 @@ function buildDailySheetData(){
   return [head, ...body];
 }
 function buildOrdersSheetData(){
-  const head = ['Internal Order Key (Clients Order Number)','Order ID (MID D2,2,6)','Date','Line Count','Product Cost','Supplier Total cost','Red Price Detected','Shipping Rule','Shipping Cost','Total Source','FX Rate','AUD','Status','Review Reason','Negative Shipping Flag'];
-  const body = STATE.orders.map(o=>[o.internalOrderKey,o.orderId,o.date,o.lines.length,round2(o.productCost),round2(o.shippingSourceCost),o.hasRedPrice?'Yes':'No',o.shippingRule,round2(o.shippingCost),round2(o.totalSource),o.fxRate??'',o.aud===null?'':round2(o.aud),o.status,o.reviewNeeded?o.issues.join(' | '):'',o.negativeShipping?'YES — REVIEW':'']);
+  const head = ['Internal Order Key (Clients Order Number)','Order ID (MID D2,2,6)','Date','Line Count','Product Cost','Supplier Total cost','Red Price Detected','Shipping Rule','Shipping Cost','Total Source','FX Rate','AUD','Status','Review Reason','Negative Shipping Flag','Red Prices Sum','Black Prices Sum (red orders)','Black part moved to Shipping'];
+  const body = STATE.orders.map(o=>[o.internalOrderKey,o.orderId,o.date,o.lines.length,round2(o.productCost),round2(o.shippingSourceCost),o.hasRedPrice?'Yes':'No',o.shippingRule,round2(o.shippingCost),round2(o.totalSource),o.fxRate??'',o.aud===null?'':round2(o.aud),o.status,o.reviewNeeded?o.issues.join(' | '):'',o.negativeShipping?'YES — REVIEW':'',o.hasRedPrice?round2(o.redSum||0):'',o.hasRedPrice?round2(o.blackSum||0):'',o.hasRedPrice?round2(o.blackToShipping||0):'']);
   return [head, ...body];
 }
 function buildDetailSheetData(){
@@ -2492,7 +2506,7 @@ $('#exportAuditBtn').addEventListener('click', ()=>{
   ], 'COGS_Audit_'+STATE.file.name.replace(/\.(xls|xlsx)$/i,'')+'.xlsx');
 });
 
-['#xeroShippingCode','#xeroCogsCode','#xeroProcessingCode','#xeroInventoryCode','#xeroTaxRate','#xeroProcessingRate','#xeroGstRate'].forEach(sel=>{
+['#xeroShippingCode','#xeroCogsCode','#xeroProcessingCode','#xeroInventoryCode','#xeroTaxRate','#xeroProcessingRate','#xeroGstRate','#xeroBlackCostPct'].forEach(sel=>{
   const el=$(sel);
   if(el) el.addEventListener('input',()=>{ if(STATE.xero && STATE.xero.length) renderXeroPreview(); });
 });
@@ -2500,7 +2514,7 @@ $('#exportAuditBtn').addEventListener('click', ()=>{
 setStep(1);
 
 function toggleXeroSettingsEdit(){
-  const fields=['#xeroShippingCode','#xeroCogsCode','#xeroProcessingCode','#xeroInventoryCode','#xeroTaxRate','#xeroProcessingRate','#xeroGstRate']
+  const fields=['#xeroShippingCode','#xeroCogsCode','#xeroProcessingCode','#xeroInventoryCode','#xeroTaxRate','#xeroProcessingRate','#xeroGstRate','#xeroBlackCostPct']
     .map(sel=>$(sel)).filter(Boolean);
   if(!fields.length) return;
   const editing=fields[0].disabled;
@@ -2521,9 +2535,16 @@ function refreshProcessingAndGst(){
 ['#xeroProcessingRate','#xeroGstRate'].forEach(sel=>{
   const el=$(sel); if(el) el.addEventListener('change',refreshProcessingAndGst);
 });
+{
+  const bp=$('#xeroBlackCostPct');
+  if(bp) bp.addEventListener('change',async()=>{
+    if(!STATE.records||!STATE.records.length||!STATE.colMap||!STATE.fx) return;
+    try{ await runFullPipeline(); }catch(e){ if(!(e&&e.name==='StaleProcessingRun')) console.error(e); }
+  });
+}
 const editXeroSettingsBtn=$('#editXeroSettingsBtn');
 if(editXeroSettingsBtn) editXeroSettingsBtn.addEventListener('click',toggleXeroSettingsEdit);
-['#xeroShippingCode','#xeroCogsCode','#xeroProcessingCode','#xeroInventoryCode','#xeroTaxRate','#xeroProcessingRate','#xeroGstRate'].forEach(sel=>{
+['#xeroShippingCode','#xeroCogsCode','#xeroProcessingCode','#xeroInventoryCode','#xeroTaxRate','#xeroProcessingRate','#xeroGstRate','#xeroBlackCostPct'].forEach(sel=>{
   const el=$(sel);
   if(el) el.addEventListener('input',()=>{ if(STATE.xero?.length) renderXeroPreview(); });
 });
